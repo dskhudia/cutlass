@@ -39,7 +39,9 @@ struct Options {
   float scale_a = 1.f, scale_b = 1.f, scale_c = 1.f, scale_d = 1.f, scale_aux = 1.f;
   bool device_scale = true;
   int iterations = 1000;
+  int warmup_iterations = 10;
   int m = 1024, n = 512, k = 1024, l = 1;
+  float eps = 0.f;
   RasterOrderOptions raster;
   int swizzle;
 
@@ -65,6 +67,8 @@ struct Options {
     cmd.get_cmd_line_argument("scale_aux", scale_aux, 1.f);
     cmd.get_cmd_line_argument("device_scale", device_scale, true);
     cmd.get_cmd_line_argument("iterations", iterations);
+    cmd.get_cmd_line_argument("warmup-iterations", warmup_iterations);
+    cmd.get_cmd_line_argument("eps", eps);
 
     char raster_char;
     cmd.get_cmd_line_argument("raster", raster_char);
@@ -103,7 +107,9 @@ struct Options {
       << "  --device_scale=<bool>       Copy scalars to device memory before kernel launch (default: true)\n"
       << "  --raster=<char>             CTA Rasterization direction (N for along N, M for along M, and H for heuristic)\n\n"
       << "  --swizzle=<int>             CTA Rasterization swizzle\n\n"
-      << "  --iterations=<int>          Number of profiling iterations to perform.\n\n";
+      << "  --iterations=<int>          Number of profiling iterations to perform.\n\n"
+      << "  --warmup-iterations=<int>   Number of warmup iterations to perform.\n\n"
+      << "  --eps=<f32>                 Threshold for error compared to reference.\n\n";
 
     out
       << "\n\nExamples:\n\n"

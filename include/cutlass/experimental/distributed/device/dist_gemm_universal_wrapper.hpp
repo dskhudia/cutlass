@@ -163,12 +163,13 @@ public:
   /// Determines whether the GEMM can execute the given problem.
   static Status
   can_implement(Arguments const& args) {
-    if (args.epilogue.thread.beta != 0.0 && DistSchedule::RemoteC) {
-      CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Selected TP uses Remote C to communicate " <<
-          "partial results, which do not support non-zero values for beta yet " <<
-          "(epilogue must be sourceless.)\n");
-      return Status::kInvalid;
-    }
+    // Daya: todo: We don't have beta supported in epilogue yet.
+    //if (args.epilogue.thread.beta != 0.0 && DistSchedule::RemoteC) {
+    //  CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Selected TP uses Remote C to communicate " <<
+    //      "partial results, which do not support non-zero values for beta yet " <<
+    //      "(epilogue must be sourceless.)\n");
+    //  return Status::kInvalid;
+    //}
 
     if (not DistSchedule::can_implement_global(args.problem_shape)) {
       CUTLASS_TRACE_HOST("  CAN IMPLEMENT: Problem shape not divisible by TP.\n");
@@ -349,11 +350,12 @@ public:
         // if (iteration == TP{} - 1) {
         //   base_args.epilogue.thread.gamma = base_args.epilogue.thread.beta;
         // } else
+        // Daya: todo: We don't have beta supported in epilogue yet.
         if (iteration > 0) {
-          base_args.epilogue.thread.beta = 1.0;
+          // base_args.epilogue.thread.beta = 1.0;
         }
         else if (iteration == 0){
-          base_args.epilogue.thread.beta = 0.0;
+          // base_args.epilogue.thread.beta = 0.0;
         }
       }
 

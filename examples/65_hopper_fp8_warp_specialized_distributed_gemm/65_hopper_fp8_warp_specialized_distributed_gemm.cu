@@ -75,21 +75,40 @@
 #include "cutlass/util/host_tensor.h"
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/util/tensor_view_io.h"
+#include "cutlass/util/reference/host/error_metrics.h"
 #include "cutlass/util/reference/host/tensor_fill.h"
+#include "cutlass/util/reference/device/tensor_fill.h"
 #include "cutlass/util/reference/host/tensor_copy.h"
 #include "cutlass/util/reference/host/tensor_compare.h"
 #include "cutlass/util/reference/host/tensor_norm.h"
 #include "cutlass/util/reference/host/gett.hpp"
 
+// Distributed GEMM headers
+#include "cutlass/experimental/distributed/device/dist_gemm_universal_wrapper.hpp"
+#include "cutlass/experimental/distributed/kernel/dist_gemm_kernel_wrapper.hpp"
+#include "cutlass/experimental/distributed/schedules/dist_gemm_1d_schedules.hpp"
 
 #include "helper.h"
 #include "hopper_fp8_commandline.hpp"
 #include "scaled_mm_epilogues_c3x.hpp"
 
+// Distributed GEMM helpers
+#include "util/benchmark.h"
+#include "util/device_copy.h"
+
 using namespace cute;
 
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
 
+/////////////////////////////////////////////////////////////////////////////////////////////////
+/// Distributed GEMM configuration
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// TP size (= number of processors/GPUs)
+using TP = _4;
+
+
+using DistSchedule = cutlass::distributed::schedules::AllGather1D_TilingCD_RotatingA<TP>;
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// GEMM kernel configurations
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -163,10 +182,18 @@ using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
     CollectiveEpilogue
 >;
 
+// We're going to use the single-device GEMM as reference
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
 // Datatypes for scalars
-using ElementScalar     = ElementCompute;
+using ElementScalar = ElementCompute;
+
+// Instantiate Distributed GEMM kernel
+using DistGemmKernel = cutlass::distributed::kernel::DistributedGemmKernelWrapper<
+    GemmKernel,
+    DistSchedule
+    >;
+using DistGemm = cutlass::distributed::device::DistributedGemmUniversalAdapter<DistGemmKernel>;
 
 using StrideA = typename Gemm::GemmKernel::StrideA;
 using StrideB = typename Gemm::GemmKernel::StrideB;
@@ -180,11 +207,23 @@ StrideC stride_C;
 StrideD stride_D;
 uint64_t seed;
 
-cutlass::HostTensor<ElementA  , LayoutA  > tensor_A;
-cutlass::HostTensor<ElementB  , LayoutB  > tensor_B;
-cutlass::HostTensor<ElementC  , LayoutC  > tensor_C;
-cutlass::HostTensor<ElementD  , LayoutD  > tensor_D;
-cutlass::HostTensor<ElementD  , LayoutD  > tensor_ref_D;
+// Reference GEMM tensors; Regular single device gemm.
+using HostTensorA = typename cutlass::HostTensor<ElementA, LayoutA>;
+using HostTensorB = typename cutlass::HostTensor<ElementB, LayoutB>;
+using HostTensorC = typename cutlass::HostTensor<ElementC, LayoutC>;
+using HostTensorD = typename cutlass::HostTensor<ElementD, LayoutD>;
+
+HostTensorA tensor_A;
+HostTensorB tensor_B;
+HostTensorC tensor_C;
+HostTensorD tensor_D;
+HostTensorD tensor_ref_D;
+
+// DistGEMM tensors (multi-device)
+HostTensorA tensor_A_arr[TP{}];
+HostTensorB tensor_B_arr[TP{}];
+HostTensorD tensor_C_arr[TP{}];
+HostTensorD tensor_D_arr[TP{}];
 
 using LayoutScalar = cutlass::layout::PackedVectorLayout;
 cutlass::HostTensor<ElementScalar, LayoutScalar> scalar_alpha;
@@ -232,36 +271,41 @@ struct Result
 template <typename Element, typename Layout>
 bool initialize_tensor(
   cutlass::TensorView<Element, Layout> view,
-  uint64_t seed) {
+  uint64_t seed,
+  bool is_device_tensor = false) {
 
   double scope_max, scope_min;
   int bits_input = cutlass::sizeof_bits<Element>::value;
-  int bits_output = cutlass::sizeof_bits<Element>::value;
 
   if (bits_input == 1) {
     scope_max = 2;
     scope_min = 0;
   }
-  else if (bits_input <= 8) {
+  else if (bits_input <= 16) {
     scope_max = 2;
     scope_min = -2;
-  }
-  else if (bits_output == 16) {
-    scope_max = 5;
-    scope_min = -5;
   }
   else {
     scope_max = 8;
     scope_min = -8;
   }
-  cutlass::reference::host::TensorFillRandomUniform(
-    view, seed, scope_max, scope_min, 0);
+  if (is_device_tensor) {
+      using Real = typename cutlass::RealType<Element>::Type;
+      cutlass::reference::device::TensorFillRandomUniform(
+              view, seed, static_cast<Real>(scope_max), static_cast<Real>(scope_min), 0);
+      cudaDeviceSynchronize();
+  } else {
+
+      cutlass::reference::host::TensorFillRandomUniform(
+        view, seed, scope_max, scope_min, 0);
+  }
 
   return true;
 }
 
 /// Initialize operands to be used in the GEMM and reference GEMM
 void initialize(const Options<RasterOrderOptions> &options) {
+  auto problem_shape = cute::make_tuple(options.m, options.n, options.k, options.l);
 
   stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(options.m, options.k, options.l));
   stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(options.n, options.k, options.l));
@@ -269,8 +313,8 @@ void initialize(const Options<RasterOrderOptions> &options) {
   stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(options.m, options.n, options.l));
 
   auto a_coord = cutlass::make_Coord(options.m * options.l, options.k);
-  auto c_coord = cutlass::make_Coord(options.m * options.l, options.n);
   auto b_coord = cutlass::make_Coord(options.k, options.n * options.l);
+  auto c_coord = cutlass::make_Coord(options.m * options.l, options.n);
 
   tensor_A.resize(a_coord);
   tensor_B.resize(b_coord);
@@ -286,6 +330,42 @@ void initialize(const Options<RasterOrderOptions> &options) {
   tensor_B.sync_device();
   tensor_C.sync_device();
   tensor_D.sync_device();
+
+  // Set up DistGEMM tensors
+  auto local_shape_A = DistSchedule::get_local_a_shape(problem_shape);
+  auto local_shape_B = DistSchedule::get_local_b_shape(problem_shape);
+  auto local_shape_C = DistSchedule::get_local_c_shape(problem_shape);
+  auto local_shape_D = DistSchedule::get_local_d_shape(problem_shape);
+
+  auto a_coord_device = cutlass::make_Coord(size(local_shape_A), 1);
+  auto b_coord_device = cutlass::make_Coord(size(local_shape_B), 1);
+  auto c_coord_device = cutlass::make_Coord(size(local_shape_C), 1);
+
+  int primary_device_idx;
+  CUDA_CHECK(cudaGetDevice(&primary_device_idx));
+
+  // Enable any-to-any access
+  for (int device_idx = 0; device_idx < TP{}; ++device_idx) {
+    int can_access;
+    CUDA_CHECK(cudaSetDevice(device_idx));
+    for (int peer_idx = 0; peer_idx < TP{}; ++peer_idx) {
+      if (peer_idx != device_idx) {
+        CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, device_idx, peer_idx));
+        if (not can_access) {
+          std::cerr << "FAILURE: Device " << device_idx << " can't access device " << peer_idx << "." <<
+            std::endl;
+          exit(EXIT_FAILURE);
+        }
+        CUDA_CHECK(cudaDeviceEnablePeerAccess(peer_idx, 0));
+      }
+    }
+
+    tensor_A_arr[device_idx].resize(a_coord_device);
+    tensor_B_arr[device_idx].resize(b_coord_device);
+    tensor_C_arr[device_idx].resize(c_coord_device);
+    tensor_D_arr[device_idx].resize(c_coord_device);
+  }
+  CUDA_CHECK(cudaSetDevice(primary_device_idx));
 
   if (options.device_scale) {
     scalar_alpha.resize(cutlass::make_Coord(1));
@@ -312,7 +392,8 @@ void initialize(const Options<RasterOrderOptions> &options) {
 }
 
 /// Populates a Gemm::Arguments structure from the given commandline options
-typename Gemm::Arguments args_from_options(const Options<RasterOrderOptions> &options)
+using GemmArguments = typename Gemm::Arguments;
+GemmArguments gemm_args_from_options(const Options<RasterOrderOptions> &options)
 {
   
   typename GemmKernel::MainloopArguments mainloop_args{tensor_A.device_data(), stride_A, tensor_B.device_data(),
@@ -321,7 +402,7 @@ typename Gemm::Arguments args_from_options(const Options<RasterOrderOptions> &op
       Epilogue::prepare_args(
               scale_A.device_data(), scale_B.device_data()),
               tensor_C.device_data(), stride_C,
-              tensor_D.device_data(), stride_D};
+              tensor_ref_D.device_data(), stride_D};
 
   typename Gemm::Arguments arguments{
     cutlass::gemm::GemmUniversalMode::kGemm,
@@ -337,52 +418,116 @@ typename Gemm::Arguments args_from_options(const Options<RasterOrderOptions> &op
   return arguments;
 }
 
-bool verify(const Options<RasterOrderOptions> &options) {
-  //
-  // Compute reference output
-  //
+using DistGemmArguments = typename DistGemm::Arguments;
+DistGemmArguments dist_gemm_args_from_options(
+    const Options<RasterOrderOptions> &options,
+    int device_idx,
+    cudaStream_t stream) {
 
-  // Create instantiation for device reference gemm kernel
-  auto A = cute::make_tensor(tensor_A.host_data(),
+  auto problem_shape = cute::make_tuple(options.m, options.n, options.k, options.l);
+
+  auto global_A = cute::make_tensor(tensor_A.device_data(),
       cute::make_layout(cute::make_shape(options.m, options.k, options.l), stride_A));
-  auto B = cute::make_tensor(tensor_B.host_data(),
+  auto global_B = cute::make_tensor(tensor_B.device_data(),
       cute::make_layout(cute::make_shape(options.n, options.k, options.l), stride_B));
-  auto C = cute::make_tensor(tensor_C.host_data(),
+  auto global_C = cute::make_tensor(tensor_C.device_data(),
       cute::make_layout(cute::make_shape(options.m, options.n, options.l), stride_C));
-  auto D = cute::make_tensor(tensor_ref_D.host_data(),
+
+  auto global_A_device_slice = DistSchedule::get_device_slice_A(global_A, device_idx);
+  auto global_B_device_slice = DistSchedule::get_device_slice_B(global_B, device_idx);
+  auto global_C_device_slice = DistSchedule::get_device_slice_C(global_C, device_idx);
+
+  auto local_shape_A = DistSchedule::get_local_a_shape(problem_shape);
+  auto local_shape_B = DistSchedule::get_local_b_shape(problem_shape);
+  auto local_shape_C = DistSchedule::get_local_c_shape(problem_shape);
+  auto local_shape_D = DistSchedule::get_local_d_shape(problem_shape);
+
+  auto local_stride_A = cutlass::make_cute_packed_stride(StrideA{}, local_shape_A);
+  auto local_stride_B = cutlass::make_cute_packed_stride(StrideB{}, local_shape_B);
+  auto local_stride_C = cutlass::make_cute_packed_stride(StrideC{}, local_shape_C);
+  auto local_stride_D = cutlass::make_cute_packed_stride(StrideD{}, local_shape_D);
+
+  auto local_A = cute::make_tensor(
+      tensor_A_arr[device_idx].device_data(),
+      make_layout(local_shape_A, local_stride_A));
+  auto local_B = cute::make_tensor(
+      tensor_B_arr[device_idx].device_data(),
+      make_layout(local_shape_B, local_stride_B));
+  auto local_C = cute::make_tensor(
+      tensor_C_arr[device_idx].device_data(),
+      make_layout(local_shape_C, local_stride_C));
+  auto local_D = cute::make_tensor(
+      tensor_D_arr[device_idx].device_data(),
+      make_layout(local_shape_D, local_stride_D));
+
+  // Copy over tensor tiles for the first iteration
+  cutlass::device_copy(global_A_device_slice, local_A, stream);
+  cutlass::device_copy(global_B_device_slice, local_B, stream);
+  cutlass::device_copy(global_C_device_slice, local_C, stream);
+
+  DistGemmArguments arguments{
+    cutlass::gemm::GemmUniversalMode::kGemm,                                       // mode
+    problem_shape,                                                                 // problem shape
+    {
+      reinterpret_cast<const ElementA*>(local_A.data()),
+      local_A.stride(),
+      reinterpret_cast<const ElementB*>(local_B.data()),
+      local_B.stride()
+    },                                                                             // mainloop
+    {
+      Epilogue::prepare_args(scale_A.device_data(), scale_B.device_data()),        //epilogue.thread
+      reinterpret_cast<const ElementC*>(local_C.data()),
+      local_C.stride(),
+      reinterpret_cast<const ElementD*>(local_D.data()),
+      local_D.stride(),
+    },                                                                             // epilogue
+    {},                                                                            // hw_info
+    {}                                                                             // scheduler
+  };
+
+  return arguments;
+}
+
+// Gathers results, moves back to the original full-sized D tensor on the primary device.
+void gather_results(const Options<RasterOrderOptions> &options, int device_idx, cudaStream_t stream = nullptr) {
+
+  auto problem_shape = cute::make_tuple(options.m, options.n, options.k, options.l);
+
+  // Global dest
+  auto global_D = cute::make_tensor(tensor_D.device_data(),
       cute::make_layout(cute::make_shape(options.m, options.n, options.l), stride_D));
-  using unused_t = decltype(D);
+  auto global_D_device_slice = DistSchedule::get_device_slice_D(global_D, device_idx);
 
-  cutlass::reference::host::GettMainloopParams<ElementAccumulator, decltype(A), decltype(B)> mainloop_params{A, B};
+  // Device_idx local dest
+  auto local_shape_D = DistSchedule::get_local_d_shape(problem_shape);
+  auto local_stride_D = cutlass::make_cute_packed_stride(StrideD{}, local_shape_D);
+  auto local_D = cute::make_tensor(
+      tensor_D_arr[device_idx].device_data(),
+      make_layout(local_shape_D, local_stride_D)
+  );
 
-  cutlass::reference::host::GettEpilogueParams<
-      ElementScalar,
-      ElementScalar,
-      ElementAccumulator,
-      ElementCompute,
-      decltype(C),
-      decltype(D),
-      unused_t, // bias
-      unused_t, // aux
-      unused_t, // valpha
-      unused_t // vbeta
-  > epilogue_params;
+  // Copy to global dest
+  cutlass::device_copy(local_D, global_D_device_slice, stream);
+}
 
-  epilogue_params.C = C;
-  epilogue_params.D = D;
-  epilogue_params.alpha = options.alpha;
-  epilogue_params.beta = options.beta;
-  epilogue_params.scale_a = options.scale_a;
-  epilogue_params.scale_b = options.scale_b;
-  epilogue_params.scale_c = options.scale_c;
-  epilogue_params.scale_d = options.scale_d;
-
-  // get reference result
-  cutlass::reference::host::Gemm3x(mainloop_params, epilogue_params);
-
-  // compare_reference
+bool verify(const Options<RasterOrderOptions> &options) {
   tensor_D.sync_host();
-  bool passed = cutlass::reference::host::TensorEquals(tensor_ref_D.host_view(), tensor_D.host_view());
+  tensor_ref_D.sync_host();
+
+  bool passed = false;
+  if (options.eps == 0.f) {
+    passed = cutlass::reference::host::TensorEquals(tensor_ref_D.host_view(), tensor_D.host_view());
+  } else {
+    double err = cutlass::reference::host::TensorRelativeErrorMetric(
+      tensor_D.host_view(),
+      tensor_ref_D.host_view());
+    passed = err < 1e-5;
+  }
+
+  if (options.m <= 64 && options.n <= 64) {
+    std::cout << "GEMM output:\n" << tensor_D.host_view() << "\n\n";
+    std::cout << "Reference output:\n" << tensor_ref_D.host_view() << "\n\n";
+  }
 
   return passed;
 }
@@ -391,34 +536,130 @@ bool verify(const Options<RasterOrderOptions> &options) {
 template <typename Gemm>
 int run(Options<RasterOrderOptions> &options)
 {
+  int primary_device_idx;
+  cudaError_t device_get_result = cudaGetDevice(&primary_device_idx);
+  if (device_get_result != cudaSuccess) {
+    throw std::runtime_error("cudaGetDevice() failed");
+  }
+
+  int num_devices;
+  CUDA_CHECK(cudaGetDeviceCount(&num_devices));
+  if (num_devices < TP{}) {
+      std::cerr << "Distributed GEMM is compiled with TP = " << TP::value << ", but " << 
+        "found only " << num_devices << " devices." <<
+        std::endl;
+      exit(EXIT_FAILURE);
+  }
+
+
   initialize(options);
 
-  // Instantiate CUTLASS kernel depending on templates
-  Gemm gemm;
+  // Reference single-GPU GEMM
+  Gemm reference_gemm;
+  cutlass::device_memory::allocation<uint8_t> reference_workspace;
 
-  // Create a structure of gemm kernel arguments suitable for invoking an instance of Gemm
-  auto arguments = args_from_options(options);
+  auto reference_arguments = gemm_args_from_options(options);
+  size_t reference_workspace_size = Gemm::get_workspace_size(reference_arguments);
+  reference_workspace = cutlass::device_memory::allocation<uint8_t>(reference_workspace_size);
 
-  // Using the arguments, query for extra workspace required for matrix multiplication computation
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
+  CUTLASS_CHECK(reference_gemm.can_implement(reference_arguments));
+  CUTLASS_CHECK(reference_gemm.initialize(reference_arguments, reference_workspace.get()));
+  CUTLASS_CHECK(reference_gemm.run());
+
+  using ElementBarrier = typename DistGemm::ElementBarrier;
+  using ElementFlag = typename DistGemmKernel::ElementFlag;
+
+  // Set up per-device streams
+  cudaStream_t stream_arr[TP{}];
+
+  for (int device_idx = 0; device_idx < TP{}; ++device_idx) {
+    CUDA_CHECK(cudaSetDevice(device_idx));
+
+    // Create stream
+    CUDA_CHECK(cudaStreamCreate(&stream_arr[device_idx]));
+  }
+
+    // Instantiate DistGEMM
+  DistGemm dist_gemm_arr[TP{}];  // Distributed GEMM array for multiple devices
 
   // Allocate workspace memory
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+  cutlass::device_memory::allocation<uint8_t> workspace_arr[TP{}];
+  cutlass::device_memory::allocation<uint8_t> exclusive_workspace_arr[TP{}];
 
-  // Check if the problem size is supported or not
-  CUTLASS_CHECK(gemm.can_implement(arguments));
+  // Cross-device workspace pointer array for gemm.initialize()
+  void * workspace_ptr_arr[TP{}];
+  void * exclusive_workspace_ptr_arr[TP{}];
 
-  // Initialize CUTLASS kernel with arguments and workspace pointer
-  CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
+  // Create a structure of gemm kernel arguments suitable for invoking an instance of Gemm
+  DistGemmArguments arguments_[TP{}];
+
+  for (int device_idx = 0; device_idx < TP{}; ++device_idx) {
+    CUDA_CHECK(cudaSetDevice(device_idx));
+
+    arguments_[device_idx] = dist_gemm_args_from_options(options, device_idx, stream_arr[device_idx]);
+
+    // Using the arguments, query for extra workspace required for matrix multiplication computation
+    size_t workspace_size = DistGemm::get_workspace_size(arguments_[device_idx]);
+    size_t exclusive_workspace_size = DistGemm::get_exclusive_workspace_size();
+
+    workspace_arr[device_idx] = cutlass::device_memory::allocation<uint8_t>(workspace_size);
+    exclusive_workspace_arr[device_idx] = cutlass::device_memory::allocation<uint8_t>(exclusive_workspace_size);
+
+    // Throw workspace pointers into arrays for gemm.initialize()
+    workspace_ptr_arr[device_idx] = workspace_arr[device_idx].get();
+    exclusive_workspace_ptr_arr[device_idx] = exclusive_workspace_arr[device_idx].get();
+
+    // Zero out exclusive workspace
+    cudaMemsetAsync(exclusive_workspace_ptr_arr[device_idx], 0, exclusive_workspace_size, stream_arr[device_idx]);
+
+    cudaDeviceSynchronize();
+  }
+
+  for (int device_idx = 0; device_idx < TP{}; ++device_idx) {
+    CUDA_CHECK(cudaSetDevice(device_idx));
+
+    // Check if the problem size is supported or not
+    CUTLASS_CHECK(dist_gemm_arr[device_idx].can_implement(arguments_[device_idx]));
+
+    // Initialize CUTLASS kernel with arguments and workspace pointer
+    CUTLASS_CHECK(dist_gemm_arr[device_idx].initialize(
+          arguments_,
+          workspace_ptr_arr,
+          exclusive_workspace_ptr_arr,
+          device_idx,
+          stream_arr[device_idx],
+#ifdef CUTLASS_ENABLE_GDC_FOR_SM90
+          /* launch_with_pdl = */ true
+#else
+          /* launch_with_pdl = */ false
+#endif
+          ));
+
+    cudaDeviceSynchronize();
+  }
 
   // Correctness / Warmup iteration
-  CUTLASS_CHECK(gemm.run());
+  std::cout << std::endl << "  running DistGEMM..." << std::endl;
 
-  // Check if output from CUTLASS kernel and reference kernel are equal or not
+  for (int device_idx = 0; device_idx < TP{}; ++device_idx) {
+    CUDA_CHECK(cudaSetDevice(device_idx));
+    CUTLASS_CHECK(dist_gemm_arr[device_idx].run(stream_arr[device_idx]));
+  }
+  for (int device_idx = 0; device_idx < TP{}; ++device_idx) {
+    CUDA_CHECK(cudaStreamSynchronize(stream_arr[device_idx]));
+    CUDA_CHECK(cudaGetLastError());
+    gather_results(options, device_idx);
+  }
+
+  std::cout << "  running DistGEMM finished without runtime errors" << std::endl;
+
+  //// Check if output from CUTLASS kernel and reference kernel are equal or not
   Result result;
+
   result.passed = verify(options);
 
-  std::cout << "  Disposition: " << (result.passed ? "Passed" : "Failed") << std::endl;
+  std::cout << std::endl << "  Disposition (eps: " << options.eps << "): " << 
+    (result.passed ? "Passed" : "Failed") << std::endl;
 
   if (!result.passed) {
     exit(-1);
@@ -427,17 +668,84 @@ int run(Options<RasterOrderOptions> &options)
   // Run profiling loop
   if (options.iterations > 0)
   {
-    GpuTimer timer;
-    timer.start();
-    for (int iter = 0; iter < options.iterations; ++iter) {
-      CUTLASS_CHECK(gemm.run());
+        float elapsed_ms = 0.f;
+
+    // Warmup
+    std::cout << "  Warming up for " << options.warmup_iterations << " iterations." << std::endl;
+    for (int warmup_iter = 0; warmup_iter < options.warmup_iterations; ++warmup_iter) {
+      for (int device_idx = 0; device_idx < TP{}; ++device_idx) {
+        CUDA_CHECK(cudaSetDevice(device_idx));
+        CUTLASS_CHECK(dist_gemm_arr[device_idx].run(stream_arr[device_idx]));
+      }
     }
-    timer.stop();
+
+    for (int device_idx = 0; device_idx < TP{}; ++device_idx) {
+      CUDA_CHECK(cudaSetDevice(device_idx));
+      CUDA_CHECK(cudaStreamSynchronize(stream_arr[device_idx]));
+    }
+
+    CUDA_CHECK(cudaSetDevice(primary_device_idx));
+
+    // Benchmark
+    std::cout << "  Profiling for " << options.iterations << " iterations." << std::endl;
+    using AtomicBoolean = cuda::atomic<bool>;
+    AtomicBoolean* atomic_flag_ptr;
+    CUDA_CHECK(cudaHostAlloc(&atomic_flag_ptr, sizeof(AtomicBoolean), cudaHostAllocPortable));
+    atomic_flag_ptr->store(false);
+
+    cutlass::DistGpuTimer<TP{}> timer;
+
+    for (int device_idx = 0; device_idx < TP{}; ++device_idx) {
+      CUDA_CHECK(cudaSetDevice(device_idx));
+      cutlass::delay_kernel<<<1, 1, 0, stream_arr[device_idx]>>>(atomic_flag_ptr);
+      CUDA_CHECK(cudaGetLastError());
+    }
+
+    for (int device_idx = 0; device_idx < TP{}; ++device_idx) {
+      timer.start(device_idx, stream_arr[device_idx]);
+    }
+
+    atomic_flag_ptr->store(true);
+
+    for (int profile_iter = 0; profile_iter < options.iterations; ++profile_iter) {
+      for (int device_idx = 0; device_idx < TP{}; ++device_idx) {
+        CUDA_CHECK(cudaSetDevice(device_idx));
+        CUTLASS_CHECK(dist_gemm_arr[device_idx].run(stream_arr[device_idx]));
+      }
+    }
+
+    for (int device_idx = 0; device_idx < TP{}; ++device_idx) {
+      CUDA_CHECK(cudaSetDevice(device_idx));
+      timer.stop(device_idx, stream_arr[device_idx]);
+    }
+
+    CUDA_CHECK(cudaSetDevice(primary_device_idx));
+
+    for (int device_idx = 0; device_idx < TP{}; ++device_idx) {
+      elapsed_ms = max(elapsed_ms, timer.elapsed_millis(device_idx));
+    }
 
     // Compute average runtime and TFLOPs.
-    float elapsed_ms = timer.elapsed_millis();
     result.avg_runtime_ms = double(elapsed_ms) / double(options.iterations);
-    result.tflops = options.tflops(result.avg_runtime_ms / 1000.0);
+    double avg_runtime_s = (double)(result.avg_runtime_ms / 1000.0);
+    // divide by TP to factor for the number of devices
+    result.tflops = options.tflops(avg_runtime_s) / TP{};
+
+    auto [local_M, local_N, local_K, local_L] = DistSchedule::get_local_gemm_shape(
+        cute::make_tuple(options.m, options.n, options.k, options.l));
+
+    std::cout << std::endl;
+    std::cout << "  TP: " << TP::value << std::endl;
+    std::cout << "  Problem Size: " << 
+      options.m << " x " << 
+      options.n << " x " << 
+      options.k << " x " << 
+      options.l << std::endl;
+    std::cout << "  Local GEMM Problem Size: " << 
+      local_M << " x " << 
+      local_N << " x " << 
+      local_K << " x " << 
+      local_L<< std::endl;
 
     std::string raster = "Heuristic";
 
@@ -463,9 +771,10 @@ int run(Options<RasterOrderOptions> &options)
 
 int main(int argc, char const **args) {
 
-  // CUTLASS must be compiled with CUDA 12.0 Toolkit to run this example
+  // CUTLASS must be compiled with CUDA Toolkit 12.5 or newer to run this example
   // and must have compute capability at least 90.
-  if (__CUDACC_VER_MAJOR__ < 12) {
+  // Some necessary cuda graph APIs were only introduced in CUDA 12.4.
+  if (__CUDACC_VER_MAJOR__ < 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 4)) {
     std::cerr << "This example requires CUDA 12 or newer.\n";
     // Returning zero so this test passes on older Toolkits. Its actions are no-op.
     return 0;
