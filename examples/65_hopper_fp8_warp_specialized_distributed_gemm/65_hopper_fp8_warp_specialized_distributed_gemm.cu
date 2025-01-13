@@ -76,6 +76,7 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/util/tensor_view_io.h"
 #include "cutlass/util/reference/host/tensor_fill.h"
+#include "cutlass/util/reference/device/tensor_fill.h"
 #include "cutlass/util/reference/host/tensor_copy.h"
 #include "cutlass/util/reference/host/tensor_compare.h"
 #include "cutlass/util/reference/host/tensor_norm.h"
@@ -185,6 +186,7 @@ cutlass::HostTensor<ElementB  , LayoutB  > tensor_B;
 cutlass::HostTensor<ElementC  , LayoutC  > tensor_C;
 cutlass::HostTensor<ElementD  , LayoutD  > tensor_D;
 cutlass::HostTensor<ElementD  , LayoutD  > tensor_ref_D;
+cutlass::HostTensor<ElementD  , LayoutD  > tensor_cache_clear;
 
 using LayoutScalar = cutlass::layout::PackedVectorLayout;
 cutlass::HostTensor<ElementScalar, LayoutScalar> scalar_alpha;
@@ -232,7 +234,8 @@ struct Result
 template <typename Element, typename Layout>
 bool initialize_tensor(
   cutlass::TensorView<Element, Layout> view,
-  uint64_t seed) {
+  uint64_t seed,
+  bool is_device_tensor = false) {
 
   double scope_max, scope_min;
   int bits_input = cutlass::sizeof_bits<Element>::value;
@@ -254,8 +257,15 @@ bool initialize_tensor(
     scope_max = 8;
     scope_min = -8;
   }
-  cutlass::reference::host::TensorFillRandomUniform(
-    view, seed, scope_max, scope_min, 0);
+  if (is_device_tensor) {
+    using Real = typename cutlass::RealType<Element>::Type;
+    cutlass::reference::device::TensorFillRandomUniform(
+      view, seed, static_cast<Real>(scope_max), static_cast<Real>(scope_min), 0);
+    cudaDeviceSynchronize();
+  } else {
+    cutlass::reference::host::TensorFillRandomUniform(
+      view, seed, scope_max, scope_min, 0);
+  }
 
   return true;
 }
@@ -271,12 +281,15 @@ void initialize(const Options<RasterOrderOptions> &options) {
   auto a_coord = cutlass::make_Coord(options.m * options.l, options.k);
   auto c_coord = cutlass::make_Coord(options.m * options.l, options.n);
   auto b_coord = cutlass::make_Coord(options.k, options.n * options.l);
+  // 256 MiB cache clear tensor
+  auto cache_clear_coord = cutlass::make_Coord(256, int(1024*1024/sizeof(ElementD)));
 
   tensor_A.resize(a_coord);
   tensor_B.resize(b_coord);
   tensor_C.resize(c_coord);
   tensor_D.resize(c_coord);
   tensor_ref_D.resize(c_coord);
+  tensor_cache_clear.resize(cache_clear_coord);
 
   initialize_tensor(tensor_A.host_view(), seed + 2022);
   initialize_tensor(tensor_B.host_view(), seed + 2023);
@@ -427,6 +440,16 @@ int run(Options<RasterOrderOptions> &options)
   // Run profiling loop
   if (options.iterations > 0)
   {
+    // warmup iterations
+    for (int iter = 0; iter < options.warmup_iterations; ++iter) {
+      CUTLASS_CHECK(gemm.run());
+    }
+
+    // Cache clear
+    // Run a number of warmup iterations and one measuring iteration to make cache clearing effective
+    // --warmup_iterations=1000 --iterations=1
+    initialize_tensor(tensor_cache_clear.device_view(), seed + 2022, true /* is_device_tensor */);
+
     GpuTimer timer;
     timer.start();
     for (int iter = 0; iter < options.iterations; ++iter) {
